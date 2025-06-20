@@ -8,7 +8,6 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from tqdm import tqdm
 import time
-import sys
 
 CHAT_FILE = "chat.txt"
 OUTPUT_EXCEL = "extracted_links.xlsx"
@@ -263,7 +262,7 @@ def main():
         print(f"   • Unique senders: {df['Sender'].nunique()}")
         print(f"   • Date range: {df['Date'].min()} to {df['Date'].max()}")
         top_senders = df["Sender"].value_counts().head(3)
-        print(f"   • Top link sharers:")
+        print("   • Top link sharers:")
         for sender, count in top_senders.items():
             print(f"     - {sender}: {count} links")
 
