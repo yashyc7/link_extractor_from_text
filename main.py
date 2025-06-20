@@ -1,41 +1,31 @@
 import re
 import pandas as pd
 from datetime import datetime
-import requests
+import aiohttp
+import asyncio
+import async_timeout
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse
+from tqdm import tqdm
 import time
 import sys
-from urllib.parse import urlparse
 
 CHAT_FILE = "chat.txt"
 OUTPUT_EXCEL = "extracted_links.xlsx"
 
-# Updated regex pattern to handle various WhatsApp export formats
+# Regex patterns
 DATE_PATTERN = (
     r"^(\d{1,2}/\d{1,2}/\d{2,4}),\s*(\d{1,2}:\d{2}\s*[apAP][mM])\s*-\s*(.*?):\s*(.*)$"
 )
 URL_PATTERN = r"(https?://[^\s]+)"
 
-headers = {
+# Headers for HTTP requests
+HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
 
-
-class ProgressAnimation:
-    def __init__(self):
-        self.spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-        self.current = 0
-
-    def spin(self):
-        char = self.spinner_chars[self.current % len(self.spinner_chars)]
-        self.current += 1
-        return char
-
-    def progress_bar(self, current, total, width=40):
-        percentage = current / total
-        filled = int(width * percentage)
-        bar = "█" * filled + "░" * (width - filled)
-        return f"[{bar}] {current}/{total} ({percentage:.1%})"
+# Cache for storing fetched titles and descriptions
+FETCH_CACHE = {}
 
 
 def animate_text(text, delay=0.05):
@@ -48,27 +38,20 @@ def animate_text(text, delay=0.05):
 
 def clean_time_string(time_str):
     """Clean time string by removing Unicode spaces and normalizing format"""
-    # Remove various Unicode space characters
-    time_str = time_str.replace("\u202f", " ")  # Narrow no-break space
-    time_str = time_str.replace("\u00a0", " ")  # Non-breaking space
-    time_str = time_str.replace("\u2009", " ")  # Thin space
-    time_str = time_str.replace("\u200a", " ")  # Hair space
-
-    # Normalize multiple spaces to single space
+    time_str = (
+        time_str.replace("\u202f", " ")
+        .replace("\u00a0", " ")
+        .replace("\u2009", " ")
+        .replace("\u200a", " ")
+    )
     time_str = re.sub(r"\s+", " ", time_str.strip())
-
-    # Ensure there's a space before AM/PM
     time_str = re.sub(r"(\d)([apAP][mM])", r"\1 \2", time_str)
-
     return time_str
 
 
 def parse_datetime(date_str, time_str):
     """Parse datetime with multiple format attempts"""
-    # Clean the time string
     time_str = clean_time_string(time_str)
-
-    # Try different datetime formats
     datetime_formats = [
         "%d/%m/%y %I:%M %p",
         "%d/%m/%Y %I:%M %p",
@@ -77,57 +60,57 @@ def parse_datetime(date_str, time_str):
         "%d/%m/%y %H:%M",
         "%d/%m/%Y %H:%M",
     ]
-
     for fmt in datetime_formats:
         try:
-            full_datetime_str = f"{date_str} {time_str}".lower()
-            return datetime.strptime(full_datetime_str, fmt)
+            return datetime.strptime(f"{date_str} {time_str}".lower(), fmt)
         except ValueError:
             continue
-
-    # If all formats fail, try without AM/PM
     try:
-        # Extract just the time part and assume 24-hour format
         time_match = re.search(r"(\d{1,2}:\d{2})", time_str)
         if time_match:
-            clean_time = time_match.group(1)
-            return datetime.strptime(f"{date_str} {clean_time}", "%d/%m/%y %H:%M")
+            return datetime.strptime(
+                f"{date_str} {time_match.group(1)}", "%d/%m/%y %H:%M"
+            )
     except ValueError:
         pass
-
     raise ValueError(f"Unable to parse datetime: '{date_str} {time_str}'")
 
 
-def fetch_title_description(url, progress_anim):
-    """Fetch title and description with progress indication"""
-    try:
-        # Clean URL - remove trailing punctuation that might interfere
-        url = url.rstrip(".,;!?")
+async def fetch_title_description(session, url, semaphore):
+    """Fetch title and description asynchronously"""
+    # Check cache first
+    if url in FETCH_CACHE:
+        return FETCH_CACHE[url]
 
-        # Validate URL
+    try:
+        # Clean URL
+        url = url.rstrip(".,;!?")
         parsed = urlparse(url)
         if not parsed.scheme or not parsed.netloc:
             return "Invalid URL", "Invalid URL format"
 
-        spinner = progress_anim.spin()
-        print(
-            f"\r{spinner} Fetching: {url[:60]}{'...' if len(url) > 60 else ''}",
-            end="",
-            flush=True,
-        )
+        async with semaphore:
+            async with async_timeout.timeout(15):
+                async with session.get(url, headers=HEADERS) as response:
+                    if response.status != 200:
+                        return (
+                            f"HTTP Error {response.status}",
+                            f"HTTP error occurred: {response.status}",
+                        )
+                    text = await response.text()
 
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(text, "html.parser")
 
         # Extract title
         title = "N/A"
         if soup.title and soup.title.string:
             title = soup.title.string.strip()
         elif soup.find("meta", attrs={"property": "og:title"}):
-            og_title = soup.find("meta", attrs={"property": "og:title"})
-            title = og_title.get("content", "N/A").strip()
+            title = (
+                soup.find("meta", attrs={"property": "og:title"})
+                .get("content", "N/A")
+                .strip()
+            )
 
         # Extract description
         description = "N/A"
@@ -136,31 +119,55 @@ def fetch_title_description(url, progress_anim):
             or soup.find("meta", attrs={"property": "og:description"})
             or soup.find("meta", attrs={"name": "Description"})
         )
-
         if desc_tag and desc_tag.get("content"):
             description = desc_tag["content"].strip()
 
+        # Cache the result
+        FETCH_CACHE[url] = (title, description)
         return title, description
 
-    except requests.exceptions.Timeout:
+    except asyncio.TimeoutError:
         return "Timeout Error", "Request timed out"
-    except requests.exceptions.ConnectionError:
+    except aiohttp.ClientConnectionError:
         return "Connection Error", "Failed to connect to URL"
-    except requests.exceptions.HTTPError as e:
-        return f"HTTP Error {e.response.status_code}", f"HTTP error occurred: {e}"
     except Exception as e:
         return "Fetch Error", f"Error: {str(e)[:100]}..."
 
 
+async def fetch_all_urls(urls_data, max_concurrent=10):
+    """Fetch titles and descriptions for all URLs concurrently"""
+    semaphore = asyncio.Semaphore(max_concurrent)
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for url_data in urls_data:
+            tasks.append(fetch_title_description(session, url_data["url"], semaphore))
+        results = []
+        for task, url_data in tqdm(
+            zip(asyncio.as_completed(tasks), urls_data),
+            total=len(urls_data),
+            desc="Fetching URLs",
+        ):
+            title, description = await task
+            results.append(
+                {
+                    "Sender": url_data["sender"],
+                    "Date": url_data["datetime"].date(),
+                    "URL": url_data["url"],
+                    "Title": title,
+                    "Description": description,
+                    "Time": url_data["datetime"].time(),
+                    "Line_Number": url_data["line_num"],
+                    "Original_Line": url_data["original_line"],
+                }
+            )
+        return results
+
+
 def main():
-    # Animated startup
     animate_text("🚀 Starting WhatsApp Chat Link Extractor...", 0.03)
     time.sleep(0.5)
 
-    progress_anim = ProgressAnimation()
-    entries = []
-
-    # Check if chat file exists
+    # Read chat file
     try:
         with open(CHAT_FILE, "r", encoding="utf-8") as file:
             lines = file.readlines()
@@ -179,51 +186,41 @@ def main():
     all_urls = []
     failed_lines = []
 
-    for line_num, line in enumerate(lines, 1):
-        spinner = progress_anim.spin()
-        print(f"\r{spinner} Parsing line {line_num}/{len(lines)}", end="", flush=True)
-
+    for line_num, line in enumerate(tqdm(lines, desc="Parsing lines")):
         line = line.strip()
         if not line:
             continue
-
         match = re.match(DATE_PATTERN, line)
         if match:
             date_str, time_str, sender, message = match.groups()
             links = re.findall(URL_PATTERN, message)
-
-            if links:  # Only process if there are links
+            if links:
                 try:
                     dt = parse_datetime(date_str, time_str)
-
                     for url in links:
                         all_urls.append(
                             {
                                 "url": url,
                                 "sender": sender.strip(),
                                 "datetime": dt,
-                                "line_num": line_num,
+                                "line_num": line_num + 1,
                                 "original_line": line[:100] + "..."
                                 if len(line) > 100
                                 else line,
                             }
                         )
-
                 except ValueError as e:
                     failed_lines.append(
                         {
-                            "line_num": line_num,
+                            "line_num": line_num + 1,
                             "error": str(e),
                             "line": line[:100] + "..." if len(line) > 100 else line,
                         }
                     )
-                    continue
 
     print(f"\n✅ Found {len(all_urls)} URLs to process")
-
     if failed_lines:
         print(f"⚠️  {len(failed_lines)} lines couldn't be parsed (saved to debug file)")
-        # Save failed lines for debugging
         with open("failed_lines.txt", "w", encoding="utf-8") as f:
             f.write("Failed to parse these lines:\n\n")
             for fail in failed_lines:
@@ -236,48 +233,17 @@ def main():
 
     time.sleep(0.5)
 
-    # Fetch titles and descriptions
+    # Fetch titles and descriptions asynchronously
     print("\n🌐 Fetching website information...")
-
-    for i, url_data in enumerate(all_urls):
-        # Progress bar
-        progress_bar = progress_anim.progress_bar(i, len(all_urls))
-        print(f"\r{progress_bar}", end="", flush=True)
-
-        title, description = fetch_title_description(url_data["url"], progress_anim)
-
-        entries.append(
-            {
-                "Sender": url_data["sender"],
-                "URL": url_data["url"],
-                "Title": title,
-                "Description": description,
-                "Date": url_data["datetime"].date(),
-                "Time": url_data["datetime"].time(),
-                "Line_Number": url_data["line_num"],
-                "Original_Line": url_data["original_line"],
-            }
-        )
-
-        # Small delay to be respectful to servers
-        time.sleep(0.1)
-
-    # Final progress update
-    progress_bar = progress_anim.progress_bar(len(all_urls), len(all_urls))
-    print(f"\r{progress_bar}")
+    entries = asyncio.run(fetch_all_urls(all_urls, max_concurrent=10))
 
     # Export to Excel
     print("\n💾 Exporting to Excel...")
     try:
         df = pd.DataFrame(entries)
-
-        # Sort by datetime
         df_sorted = df.sort_values(["Date", "Time"])
-
         with pd.ExcelWriter(OUTPUT_EXCEL, engine="openpyxl") as writer:
             df_sorted.to_excel(writer, index=False, sheet_name="Links")
-
-            # Auto-adjust column widths
             worksheet = writer.sheets["Links"]
             for column in worksheet.columns:
                 max_length = 0
@@ -292,14 +258,10 @@ def main():
                 worksheet.column_dimensions[column_letter].width = adjusted_width
 
         print(f"✅ Successfully exported {len(df)} links to '{OUTPUT_EXCEL}'")
-
-        # Summary statistics
         print("\n📊 Summary:")
         print(f"   • Total links processed: {len(df)}")
         print(f"   • Unique senders: {df['Sender'].nunique()}")
         print(f"   • Date range: {df['Date'].min()} to {df['Date'].max()}")
-
-        # Show top senders
         top_senders = df["Sender"].value_counts().head(3)
         print(f"   • Top link sharers:")
         for sender, count in top_senders.items():
